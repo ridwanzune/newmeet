@@ -1,5 +1,3 @@
-// WebRTCService with Railway signaling server integration
-
 type SignalMessage =
   | { type: 'join'; userId: string }
   | { type: 'signal'; targetId: string; signal: any }
@@ -9,15 +7,12 @@ class WebRTCService {
   private localStream: MediaStream | null = null;
   private peerConnections: Record<string, RTCPeerConnection> = {};
   private myId: string | null = null;
-
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private dataArray: Uint8Array | null = null;
   private audioLevelCallback: ((level: number) => void) | null = null;
   private animationFrameId: number | null = null;
-
-  private ws: WebSocket | null = null;
-  private signalingUrl: string = "wss://newmeet-production.up.railway.app";
+  private sendSignal: ((targetId: string, signal: any) => void) | null = null;
 
   private iceConfig = {
     iceServers: [
@@ -26,62 +21,23 @@ class WebRTCService {
     ],
   };
 
-  public async start(myId: string): Promise<void> {
+  public async start(myId: string, sendSignal: (targetId: string, signal: any) => void): Promise<void> {
     this.myId = myId;
+    this.sendSignal = sendSignal;
     try {
       this.localStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: false,
       });
       this.setupAudioAnalysis();
-      this.connectSignaling();
     } catch (error) {
       console.error("Error accessing media devices.", error);
       throw error;
     }
   }
 
-  private connectSignaling() {
-    if (!this.signalingUrl || !this.myId) return;
-    this.ws = new WebSocket(this.signalingUrl);
-
-    this.ws.onopen = () => {
-      this.ws?.send(JSON.stringify({ type: 'join', userId: this.myId }));
-    };
-
-    this.ws.onmessage = async (event) => {
-      let message: SignalMessage;
-      try {
-        message = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-      if (message.type === 'signal' && (message as any).from && message.signal) {
-        const fromId = (message as any).from;
-        await this.handleSignal(fromId, message.signal);
-      }
-    };
-
-    this.ws.onerror = (err) => {
-      console.error("WebSocket error:", err);
-    };
-    this.ws.onclose = () => {
-      console.log("Signaling server connection closed");
-    };
-  }
-
-  private sendSignal(targetId: string, signal: any) {
-    if (this.ws?.readyState === WebSocket.OPEN && this.myId) {
-      this.ws.send(JSON.stringify({
-        type: 'signal',
-        targetId,
-        signal,
-      }));
-    }
-  }
-
   public async callPeer(targetId: string) {
-    if (!this.myId || !this.localStream) return;
+    if (!this.myId || !this.localStream || !this.sendSignal) return;
     const pc = this.createPeerConnection(targetId);
 
     this.localStream.getTracks().forEach(track => {
@@ -98,27 +54,22 @@ class WebRTCService {
     const pc = new RTCPeerConnection(this.iceConfig);
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (event.candidate && this.sendSignal) {
         this.sendSignal(targetId, { candidate: event.candidate });
       }
     };
 
     pc.ontrack = (event) => {
-      console.log(`[WebRTC] Received remote track from ${targetId}`);
       const audio = new Audio();
       audio.srcObject = event.streams[0];
       audio.autoplay = true;
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log(`[WebRTC] Connection state with ${targetId}: ${pc.connectionState}`);
     };
 
     this.peerConnections[targetId] = pc;
     return pc;
   }
 
-  private async handleSignal(fromId: string, signal: any) {
+  public async handleSignal(fromId: string, signal: any) {
     let pc = this.peerConnections[fromId] || this.createPeerConnection(fromId);
 
     if (signal.sdp) {
@@ -130,7 +81,7 @@ class WebRTCService {
         });
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.sendSignal(fromId, { sdp: pc.localDescription });
+        if (this.sendSignal) this.sendSignal(fromId, { sdp: pc.localDescription });
       }
     } else if (signal.candidate) {
       try {
@@ -140,6 +91,8 @@ class WebRTCService {
       }
     }
   }
+
+  // ...rest (audio level, mute, stop, etc) as before
 
   public onAudioLevelChange(callback: (level: number) => void) {
     this.audioLevelCallback = callback;
@@ -184,7 +137,6 @@ class WebRTCService {
     if (this.peerConnections[targetId]) {
       this.peerConnections[targetId].close();
       delete this.peerConnections[targetId];
-      console.log(`[WebRTC] Disconnected from ${targetId}`);
     }
   }
 
@@ -196,22 +148,15 @@ class WebRTCService {
     if (this.audioContext && this.audioContext.state !== 'closed') {
       this.audioContext.close();
     }
-
     if (this.localStream) {
       this.localStream.getTracks().forEach(track => track.stop());
       this.localStream = null;
     }
-
     Object.keys(this.peerConnections).forEach(id => {
       this.disconnectFrom(id);
     });
-
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
     this.audioLevelCallback = null;
-    console.log("[WebRTC] Service stopped.");
+    this.sendSignal = null;
   }
 }
 
