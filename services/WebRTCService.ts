@@ -1,4 +1,4 @@
-// WebRTCService with signaling server integration via WebSocket
+// WebRTCService with Railway signaling server integration
 
 type SignalMessage =
   | { type: 'join'; userId: string }
@@ -17,7 +17,7 @@ class WebRTCService {
   private animationFrameId: number | null = null;
 
   private ws: WebSocket | null = null;
-  private signalingUrl: string | null = null;
+  private signalingUrl: string = "wss://newmeet-production.up.railway.app";
 
   private iceConfig = {
     iceServers: [
@@ -26,9 +26,8 @@ class WebRTCService {
     ],
   };
 
-  public async start(myId: string, signalingUrl: string): Promise<void> {
+  public async start(myId: string): Promise<void> {
     this.myId = myId;
-    this.signalingUrl = signalingUrl;
     try {
       this.localStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
