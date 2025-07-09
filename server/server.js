@@ -2,7 +2,17 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3001;
 
 const wss = new WebSocket.Server({ port: PORT });
-const clients = new Map();
+
+let players = {}; // { userId: { id, name, color, position, direction, length, trail } }
+let food = [{ x: 200, y: 200 }]; // Example, expand as needed
+
+function broadcast(type, data, except) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client !== except) {
+      client.send(JSON.stringify({ type, ...data }));
+    }
+  });
+}
 
 wss.on('connection', (ws) => {
   let userId = null;
@@ -16,29 +26,58 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // --- GAME STATE HANDLING ---
     if (data.type === 'join') {
       userId = data.userId;
-      clients.set(userId, ws);
-      // Optionally notify others
+      players[userId] = {
+        id: userId,
+        name: data.name || userId,
+        color: data.color || '#'+Math.floor(Math.random()*16777215).toString(16),
+        position: data.position || { x: 100, y: 100 },
+        direction: { x: 1, y: 0 },
+        length: 10,
+        trail: [],
+      };
+      ws.send(JSON.stringify({ type: 'initial-state', players, food }));
+      broadcast('user-joined', { player: players[userId] }, ws);
     }
 
-    // Signaling: relay SDP/ICE between peers
+    if (data.type === 'player-move' && players[userId]) {
+      players[userId] = { ...players[userId], ...data.state };
+      broadcast('player-move', { userId, state: players[userId] }, ws);
+    }
+
+    if (data.type === 'food-eaten') {
+      food.splice(data.foodIndex, 1);
+      broadcast('food-update', { food }, null);
+    }
+
+    if (data.type === 'leave' && userId) {
+      delete players[userId];
+      broadcast('user-left', { userId }, ws);
+    }
+
+    // --- SIGNALING HANDLING (WebRTC) ---
     if (data.type === 'signal' && data.targetId) {
-      const target = clients.get(data.targetId);
-      if (target) {
-        target.send(JSON.stringify({
-          type: 'signal',
-          from: userId,
-          signal: data.signal,
-        }));
+      // forward to target
+      for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN && client !== ws && players[data.targetId]) {
+          client.send(JSON.stringify({
+            type: 'signal',
+            from: userId,
+            signal: data.signal,
+          }));
+        }
       }
     }
   });
 
   ws.on('close', () => {
-    if (userId) clients.delete(userId);
-    // Optionally broadcast 'user-left'
+    if (userId) {
+      delete players[userId];
+      broadcast('user-left', { userId }, ws);
+    }
   });
 });
 
-console.log(`WebSocket signaling server running on port ${PORT}`);
+console.log(`Game+Signaling server running on ws://localhost:${PORT}`);
