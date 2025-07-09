@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { realtimeService } from './services/RealtimeService';
 import { webRTCService } from './services/WebRTCService';
@@ -11,7 +10,17 @@ import PlayerSnake from './components/PlayerSnake';
 import NameInputModal from './components/NameInputModal';
 import { DESKTOP_SNAKE_SPEED, DESKTOP_SNAKE_LENGTH, DESKTOP_GAME_TICK_RATE } from './constants';
 
+// === MULTIPLAYER/AUDIO MODS: ===
+// - Uses a real WebSocket for game state and signaling
+// - Auto-connects audio between all users
+// - Handles player join/leave, food, and peer connections
+
 type ActiveApp = 'desktop' | 'chalkboard';
+
+// Utility to generate a random color
+function randomColor() {
+  return "#" + Math.floor(Math.random() * 16777215).toString(16);
+}
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -30,6 +39,18 @@ const App: React.FC = () => {
   const chalkboardIconRef = useRef<HTMLDivElement>(null);
   const iconBoundsRef = useRef<DOMRect | undefined>(undefined);
 
+  // --- Multiplayer: store my userId and ensure it's unique for session ---
+  // Use a consistent id for the user (session-based)
+  const myIdRef = useRef<string>(() => {
+    if (window.localStorage.getItem('snakeUserId')) {
+      return window.localStorage.getItem('snakeUserId')!;
+    }
+    const newId = Math.random().toString(36).substr(2, 9);
+    window.localStorage.setItem('snakeUserId', newId);
+    return newId;
+  });
+
+  // ---- Multiplayer: collision helpers ----
   const checkCollision = (playerPos: Point, iconRect?: DOMRect): boolean => {
     if (!iconRect) return false;
     return (
@@ -40,8 +61,8 @@ const App: React.FC = () => {
     );
   };
 
+  // ---- Game loop ----
   const updateGame = useCallback((time: number) => {
-    // Pause game if app is not desktop, user isn't set, or name modal is open
     if (activeApp !== 'desktop' || !currentUser || needsToSetName) {
       gameLoopRef.current = requestAnimationFrame(updateGame);
       return;
@@ -75,14 +96,15 @@ const App: React.FC = () => {
             trail: [],
             length: DESKTOP_SNAKE_LENGTH,
         };
-        realtimeService.updatePlayerPosition(currentUser.id, resetState);
+        // Send position to backend
+        realtimeService.sendPlayerMove(currentUser.id, resetState);
         return { ...prevStates, [currentUser.id]: resetState };
       }
 
       // --- Self Collision ---
-      for (const trailPoint of myState.trail.slice(1)) { // slice(1) to not check head against neck
+      for (const trailPoint of myState.trail.slice(1)) {
         const distance = Math.hypot(newPosition.x - trailPoint.x, newPosition.y - trailPoint.y);
-        if (distance < 10) { // Collision threshold
+        if (distance < 10) {
             return resetPlayer();
         }
       }
@@ -92,7 +114,7 @@ const App: React.FC = () => {
       let foodEatenIndex = -1;
       foodDots.forEach((dot, index) => {
         const distance = Math.hypot(newPosition.x - dot.x, newPosition.y - dot.y);
-        if (distance < 12) { // collision threshold
+        if (distance < 12) {
             foodEatenIndex = index;
             lengthIncrease += 5;
         }
@@ -102,15 +124,13 @@ const App: React.FC = () => {
           realtimeService.eatFood({userId: currentUser.id, foodIndex: foodEatenIndex});
       }
 
-
       // --- Player Collision ---
       for (const userId in prevStates) {
         if (userId === currentUser.id) continue;
         const otherPlayerState = prevStates[userId];
-        // Don't collide with the very head of the other snake, only its body
         for (const trailPoint of otherPlayerState.trail.slice(1)) {
             const distance = Math.hypot(newPosition.x - trailPoint.x, newPosition.y - trailPoint.y);
-            if (distance < 10) { // Collision threshold
+            if (distance < 10) {
                 return resetPlayer();
             }
         }
@@ -127,14 +147,15 @@ const App: React.FC = () => {
         length: newLength,
       };
 
-      realtimeService.updatePlayerPosition(currentUser.id, newState);
+      // Broadcast movement to backend
+      realtimeService.sendPlayerMove(currentUser.id, newState);
       return { ...prevStates, [currentUser.id]: newState };
     });
-    
+
     gameLoopRef.current = requestAnimationFrame(updateGame);
   }, [activeApp, currentUser, foodDots, needsToSetName]);
-  
-  // Game loop and keyboard controls
+
+  // ---- Game loop and keyboard controls ----
   useEffect(() => {
     if (activeApp === 'desktop' && currentUser && !needsToSetName) {
       lastUpdateTimeRef.current = performance.now();
@@ -153,13 +174,13 @@ const App: React.FC = () => {
           }
           if (newDirection !== myState.direction) {
              const newState = { ...myState, direction: newDirection };
-             realtimeService.updatePlayerPosition(currentUser.id, newState);
+             realtimeService.sendPlayerMove(currentUser.id, newState);
              return { ...prev, [currentUser.id]: newState };
           }
           return prev;
         });
       };
-      
+
       window.addEventListener('keydown', handleKeyDown);
       return () => {
         if (gameLoopRef.current) cancelAnimationFrame(gameLoopRef.current);
@@ -167,8 +188,8 @@ const App: React.FC = () => {
       };
     }
   }, [activeApp, currentUser, updateGame, needsToSetName]);
-  
-  // Check for app collisions
+
+  // ---- App collision (open chalkboard) ----
   useEffect(() => {
     if (activeApp !== 'desktop' || !currentUser) return;
     const myState = playerStates[currentUser.id];
@@ -179,73 +200,88 @@ const App: React.FC = () => {
     }
   }, [playerStates, activeApp, currentUser]);
 
-  // Initial setup and real-time event listeners
+  // ---- Multiplayer: connect, handle events, peer connections ----
   useEffect(() => {
-    const user = realtimeService.join();
-    if (user) {
-      setCurrentUser(user);
-      setNeedsToSetName(true);
-    } else {
-      setIsRoomFull(true);
-      return;
-    }
-
-    webRTCService.start(user.id).catch(err => console.error("Mic access error:", err));
-    
-    const onInitialState = (data: InitialStateEvent) => {
-        setUsers(data.users);
-        setFoodDots(data.food);
-        if (data.users.some(u => u.id === user.id) && !playerStates[user.id]) {
-            const initialState: PlayerState = {
-                position: { x: Math.random() * window.innerWidth, y: Math.random() * window.innerHeight },
-                trail: [],
-                direction: { x: 1, y: 0 },
-                length: DESKTOP_SNAKE_LENGTH,
-            };
-            setPlayerStates(prev => ({ ...prev, [user.id]: initialState }));
-            realtimeService.updatePlayerPosition(user.id, initialState);
-        }
+    // --- User setup ---
+    const myId = myIdRef.current as unknown as string;
+    const myUser: User = {
+      id: myId,
+      name: `Player#${myId.substr(0, 4)}`,
+      color: randomColor(),
     };
-    const onUserJoined = (newUser: User) => setUsers(prev => [...prev, newUser]);
-    const onUserLeft = (userId: string) => {
-      setUsers(prev => prev.filter(u => u.id !== userId));
-      setPlayerStates(prev => {
-        const newStates = { ...prev };
-        delete newStates[userId];
-        return newStates;
+    setCurrentUser(myUser);
+
+    // Connect to backend
+    realtimeService.connect(myUser);
+
+    // Setup WebRTC for audio (pass signaling function)
+    webRTCService.start(myId, (targetId, signal) => {
+      realtimeService.sendSignal(targetId, signal);
+    });
+
+    // -- Event handlers --
+    const onInitialState = (data: { players: Record<string, PlayerState>, food: Point[] }) => {
+      setPlayerStates(data.players);
+      setFoodDots(data.food);
+      // Connect to all peers
+      Object.keys(data.players).forEach(pid => {
+        if (pid !== myId) webRTCService.callPeer(pid);
       });
-      webRTCService.disconnectFrom(userId);
     };
-    const onUserUpdated = (updatedUser: User) => {
-        setUsers(prev => prev.map(u => u.id === updatedUser.id ? updatedUser : u));
-    };
-    const onPlayerMoved = (data: { userId: string; playerState: PlayerState }) => {
-       setPlayerStates(prev => ({ ...prev, [data.userId]: data.playerState }));
-    };
-    const onFoodStateUpdated = (newFoodState: Point[]) => {
-        setFoodDots(newFoodState);
-    }
 
+    const onUserJoined = (data: { player: User }) => {
+      setUsers(prev => {
+        if (prev.find(u => u.id === data.player.id)) return prev;
+        return [...prev, data.player];
+      });
+      // Auto connect peer audio
+      if (data.player.id !== myId) webRTCService.callPeer(data.player.id);
+    };
+
+    const onUserLeft = (data: { userId: string }) => {
+      setUsers(prev => prev.filter(u => u.id !== data.userId));
+      setPlayerStates(prev => {
+        const ns = { ...prev };
+        delete ns[data.userId];
+        return ns;
+      });
+      webRTCService.disconnectFrom(data.userId);
+    };
+
+    const onPlayerMove = (data: { userId: string, state: PlayerState }) => {
+      setPlayerStates(prev => ({ ...prev, [data.userId]: data.state }));
+    };
+
+    const onFoodUpdate = (data: { food: Point[] }) => {
+      setFoodDots(data.food);
+    };
+
+    const onSignal = (data: { from: string, signal: any }) => {
+      webRTCService.handleSignal(data.from, data.signal);
+    };
+
+    // Register event handlers
     realtimeService.on('initial-state', onInitialState);
     realtimeService.on('user-joined', onUserJoined);
     realtimeService.on('user-left', onUserLeft);
-    realtimeService.on('user-updated', onUserUpdated);
-    realtimeService.on('player-moved', onPlayerMoved);
-    realtimeService.on('food-state-updated', onFoodStateUpdated);
+    realtimeService.on('player-move', onPlayerMove);
+    realtimeService.on('food-update', onFoodUpdate);
+    realtimeService.on('signal', onSignal);
 
+    // Clean up
     return () => {
-      realtimeService.leave(user.id);
+      realtimeService.leave(myId);
       realtimeService.off('initial-state', onInitialState);
       realtimeService.off('user-joined', onUserJoined);
       realtimeService.off('user-left', onUserLeft);
-      realtimeService.off('user-updated', onUserUpdated);
-      realtimeService.off('player-moved', onPlayerMoved);
-      realtimeService.off('food-state-updated', onFoodStateUpdated);
+      realtimeService.off('player-move', onPlayerMove);
+      realtimeService.off('food-update', onFoodUpdate);
+      realtimeService.off('signal', onSignal);
       webRTCService.stop();
     };
   }, []);
 
-  // Audio level management
+  // ---- Audio level management ----
   useEffect(() => {
     webRTCService.onAudioLevelChange(level => {
       if (currentUser) {
@@ -267,23 +303,24 @@ const App: React.FC = () => {
 
     return () => clearInterval(interval);
   }, [currentUser, users]);
-  
-  // Measure icon position
+
+  // ---- Chalkboard icon position ----
   useEffect(() => {
     iconBoundsRef.current = chalkboardIconRef.current?.getBoundingClientRect();
   }, []);
 
+  // ---- UI controls ----
   const handleMuteToggle = () => {
     const newMutedState = !isMuted;
     setIsMuted(newMutedState);
     webRTCService.toggleMute(newMutedState);
   };
-  
+
   const handleNameSubmit = (name: string) => {
-      if(currentUser && name.trim()) {
-          realtimeService.updateUserName(currentUser.id, name.trim());
-          setNeedsToSetName(false);
-      }
+    if (currentUser && name.trim()) {
+      // TODO: send to backend if you want
+      setNeedsToSetName(false);
+    }
   };
 
   const handleCloseApp = () => {
@@ -297,7 +334,7 @@ const App: React.FC = () => {
           y: myState.position.y + myState.direction.y * 25,
         };
         const newState = { ...myState, position: newPosition };
-        realtimeService.updatePlayerPosition(currentUser.id, newState);
+        realtimeService.sendPlayerMove(currentUser.id, newState);
         return { ...prev, [currentUser.id]: newState };
       });
     }
@@ -314,29 +351,29 @@ const App: React.FC = () => {
   return (
     <main className={`h-screen w-screen bg-gradient-to-br from-gray-800 to-gray-900 overflow-hidden relative font-sans select-none ${!showCursor ? 'cursor-none' : ''}`}>
       <ChalkboardIcon ref={chalkboardIconRef} />
-      
+
       {!appIsOpen && foodDots.map((dot, index) => (
         <div
-            key={index}
-            className="absolute rounded-full bg-yellow-300 w-2 h-2"
-            style={{ 
-                left: `${dot.x}px`, 
-                top: `${dot.y}px`,
-                transform: 'translate(-50%, -50%)',
-                boxShadow: '0 0 6px 1px rgba(253, 230, 138, 0.7)',
-             }}
+          key={index}
+          className="absolute rounded-full bg-yellow-300 w-2 h-2"
+          style={{
+            left: `${dot.x}px`,
+            top: `${dot.y}px`,
+            transform: 'translate(-50%, -50%)',
+            boxShadow: '0 0 6px 1px rgba(253, 230, 138, 0.7)',
+          }}
         />
       ))}
 
       {!appIsOpen && Object.entries(playerStates).map(([userId, state]) => {
-          const user = users.find(u => u.id === userId);
-          return user ? <PlayerSnake key={userId} playerState={state} color={user.color} name={user.name} /> : null;
+        const user = users.find(u => u.id === userId);
+        return user ? <PlayerSnake key={userId} playerState={state} color={user.color} name={user.name} /> : null;
       })}
-      
+
       {activeApp === 'chalkboard' && currentUser && (
         <Chalkboard currentUser={currentUser} onClose={handleCloseApp} />
       )}
-      
+
       {needsToSetName && <NameInputModal onSubmit={handleNameSubmit} />}
 
       {currentUser && (
