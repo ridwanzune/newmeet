@@ -1,18 +1,19 @@
-type SignalMessage =
-  | { type: 'join'; userId: string }
-  | { type: 'signal'; targetId: string; signal: any }
-  | { type: 'signal'; from: string; signal: any };
+// WebRTCService with signaling server integration for peer-to-peer audio
+
+type SignalCallback = (targetId: string, signal: any) => void;
 
 class WebRTCService {
   private localStream: MediaStream | null = null;
   private peerConnections: Record<string, RTCPeerConnection> = {};
   private myId: string | null = null;
+
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private dataArray: Uint8Array | null = null;
   private audioLevelCallback: ((level: number) => void) | null = null;
   private animationFrameId: number | null = null;
-  private sendSignal: ((targetId: string, signal: any) => void) | null = null;
+
+  private sendSignal: SignalCallback | null = null;
 
   private iceConfig = {
     iceServers: [
@@ -21,7 +22,7 @@ class WebRTCService {
     ],
   };
 
-  public async start(myId: string, sendSignal: (targetId: string, signal: any) => void): Promise<void> {
+  public async start(myId: string, sendSignal: SignalCallback): Promise<void> {
     this.myId = myId;
     this.sendSignal = sendSignal;
     try {
@@ -38,6 +39,8 @@ class WebRTCService {
 
   public async callPeer(targetId: string) {
     if (!this.myId || !this.localStream || !this.sendSignal) return;
+    if (this.peerConnections[targetId]) return;
+
     const pc = this.createPeerConnection(targetId);
 
     this.localStream.getTracks().forEach(track => {
@@ -91,8 +94,6 @@ class WebRTCService {
       }
     }
   }
-
-  // ...rest (audio level, mute, stop, etc) as before
 
   public onAudioLevelChange(callback: (level: number) => void) {
     this.audioLevelCallback = callback;
