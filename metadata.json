@@ -1,0 +1,8 @@
+
+{
+  "name": "Collaborative Virtual Desktop",
+  "description": "A browser-based virtual desktop for up to 3 users with a shared chalkboard and voice chat. Experience real-time collaboration with synchronized cursors and drawing.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
