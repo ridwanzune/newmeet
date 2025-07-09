@@ -1,128 +1,47 @@
-import { User, Point, DrawEvent, PlayerState, InitialStateEvent } from '../types';
-import { MAX_USERS, USER_COLORS, MAX_FOOD_DOTS, FOOD_SPAWN_INTERVAL } from '../constants';
+type PlayerState = {
+  id: string;
+  name: string;
+  color: string;
+  position: { x: number; y: number };
+  direction: { x: number; y: number };
+  length: number;
+  trail: any[];
+};
 
-type EventCallback = (data: any) => void;
+type EventMap = {
+  "initial-state": (data: { players: Record<string, PlayerState>, food: any[] }) => void;
+  "user-joined": (data: { player: PlayerState }) => void;
+  "player-move": (data: { userId: string, state: PlayerState }) => void;
+  "user-left": (data: { userId: string }) => void;
+  "food-update": (data: { food: any[] }) => void;
+  "signal": (data: { from: string, signal: any }) => void;
+};
 
 class RealtimeService {
-  private users: User[] = [];
-  private listeners: Record<string, EventCallback[]> = {};
-  private foodDots: Point[] = [];
-  private foodSpawner: number | null = null;
+  private ws: WebSocket | null = null;
+  private listeners: { [K in keyof EventMap]?: EventMap[K][] } = {};
 
-  constructor() {
-    // This is a mock service. In a real application, you would connect to a
-    // WebSocket server here.
-    this.initializeFood();
-    this.startFoodSpawner();
-  }
-
-  private initializeFood(): void {
-    this.foodDots = [];
-    for (let i = 0; i < MAX_FOOD_DOTS; i++) {
-        this.addFood();
-    }
-  }
-
-  private addFood(): void {
-    this.foodDots.push({
-        x: Math.random() * window.innerWidth,
-        y: Math.random() * window.innerHeight,
-    });
-  }
-
-  private startFoodSpawner(): void {
-      if (this.foodSpawner) clearInterval(this.foodSpawner);
-      this.foodSpawner = setInterval(() => {
-          if (this.foodDots.length < MAX_FOOD_DOTS) {
-              this.addFood();
-              this.emit('food-state-updated', this.foodDots);
-          }
-      }, FOOD_SPAWN_INTERVAL) as unknown as number;
-  }
-
-  // --- Event Emitter Methods ---
-  public on(event: string, callback: EventCallback): void {
-    if (!this.listeners[event]) {
-      this.listeners[event] = [];
-    }
-    this.listeners[event].push(callback);
-  }
-
-  public off(event: string, callback: EventCallback): void {
-    if (!this.listeners[event]) return;
-    this.listeners[event] = this.listeners[event].filter(l => l !== callback);
-  }
-
-  private emit(event: string, data: any): void {
-    if (!this.listeners[event]) return;
-    this.listeners[event].forEach(callback => callback(data));
-  }
-  
-  private emitToAllBut(emitterId: string, event: string, data: any): void {
-    // In a real server, you'd send to all other clients. Here, we just call the listeners.
-    if (!this.listeners[event]) return;
-    this.listeners[event].forEach(callback => callback(data));
-  }
-
-  // --- User Management ---
-  public join(): User | null {
-    if (this.users.length >= MAX_USERS) {
-      console.warn("Room is full. Cannot join.");
-      return null;
-    }
-
-    const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const userIndex = this.users.length;
-    const newUser: User = {
-      id: userId,
-      name: `User ${userIndex + 1}`,
-      color: USER_COLORS[userIndex % USER_COLORS.length],
+  public connect(user: PlayerState, url = "wss://newmeet-production.up.railway.app") {
+    this.ws = new WebSocket(url);
+    this.ws.onopen = () => {
+      this.send({ type: 'join', ...user });
     };
-
-    // Notify existing users about the new user
-    this.emit('user-joined', newUser);
-    
-    this.users.push(newUser);
-
-    // Notify the new user about the complete current state
-    const initialState: InitialStateEvent = {
-        users: this.users,
-        food: this.foodDots,
+    this.ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      const type = msg.type as keyof EventMap;
+      this.listeners[type]?.forEach(cb => cb(msg));
     };
-    setTimeout(() => this.emit('initial-state', initialState), 0);
-    
-    return newUser;
   }
-  
-  public updateUserName(userId: string, name: string): void {
-    const user = this.users.find(u => u.id === userId);
-    if(user) {
-        user.name = name;
-        this.emit('user-updated', user);
+
+  public send(data: any) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
     }
   }
 
-  public leave(userId: string): void {
-    this.users = this.users.filter(u => u.id !== userId);
-    this.emit('user-left', userId);
-    console.log(`User ${userId} left.`);
-  }
-
-  // --- Real-time Actions ---
-  public updatePlayerPosition(userId: string, playerState: PlayerState): void {
-    // In a real app, we'd broadcast to others. Here we emit to all, including self.
-    this.emit('player-moved', { userId, playerState });
-  }
-
-  public draw(drawEvent: DrawEvent): void {
-    this.emit('drawing-data', drawEvent);
-  }
-  
-  public eatFood(data: {userId: string; foodIndex: number}): void {
-    if (this.foodDots[data.foodIndex]) {
-        this.foodDots.splice(data.foodIndex, 1);
-        this.emit('food-state-updated', this.foodDots);
-    }
+  public on<T extends keyof EventMap>(type: T, cb: EventMap[T]) {
+    if (!this.listeners[type]) this.listeners[type] = [];
+    this.listeners[type]?.push(cb);
   }
 }
 
